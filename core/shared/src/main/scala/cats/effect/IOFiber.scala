@@ -87,6 +87,9 @@ private final class IOFiber[A](
   private[this] val objectState: ArrayStack[AnyRef] = ArrayStack()
   private[this] val finalizers: ArrayStack[IO[Unit]] = ArrayStack()
   private[this] val callbacks: CallbackStack[OutcomeIO[A]] = CallbackStack.of(cb)
+  // deliberately not atomic: this only tunes how often we pack. A lost or stale
+  // increment can at worst degrade us to packing on every clear, which pack permits
+  private[this] var clearCounter: Int = 0
   private[this] var resumeTag: Byte = ExecR
   private[this] var resumeIO: IO[Any] = startIO
   private[this] val runtime: IORuntime = rt
@@ -181,12 +184,23 @@ private final class IOFiber[A](
       if (outcome == null) {
         val handle = callbacks.push(oc => cb(Right(oc)))
 
+        def clear(): Unit = {
+          val removed = callbacks.clearHandle(handle)
+          if (!removed) {
+            clearCounter += 1
+            val clearCount = clearCounter
+            if ((clearCount & (clearCount - 1)) == 0) { // power of 2
+              clearCounter = clearCount - callbacks.pack(clearCount)
+            }
+          }
+        }
+
         /* double-check */
         if (outcome != null) {
-          callbacks.clearHandle(handle)
+          clear()
           Right(outcome)
         } else {
-          Left(Some(IO { callbacks.clearHandle(handle); () }))
+          Left(Some(IO(clear())))
         }
       } else {
         Right(outcome)
