@@ -139,7 +139,30 @@ trait GenConcurrent[F[_], E] extends GenSpawn[F, E] {
 
     implicit val F: GenConcurrent[F, E] = this
 
-    MiniSemaphore[F](n).flatMap { sem => ta.parTraverse { a => sem.withPermit(f(a)) } }
+    ta.traverse(a => deferred[B].tupleLeft(a)).flatMap { slots =>
+      val work = slots.toList.toVector
+
+      ref(0).flatMap { idx =>
+        def step: F[Unit] =
+          idx.modify(i => (i + 1, i)).flatMap { i =>
+            if (i >= work.size) unit
+            else {
+              val (a, slot) = work(i)
+              uncancelable { poll =>
+                start(f(a)).flatMap { fib =>
+                  onCancel(poll(fib.join), fib.cancel).flatMap {
+                    case Outcome.Succeeded(fb) => fb.flatMap(b => slot.complete(b).void)
+                    case Outcome.Errored(e) => raiseError[Unit](e)
+                    case Outcome.Canceled() => poll(canceled) *> never[Unit]
+                  }
+                }
+              } >> step
+            }
+          }
+
+        List.fill(n min work.size)(step).parSequence_ *> slots.traverse(_._2.get)
+      }
+    }
   }
 
   /**
@@ -152,7 +175,27 @@ trait GenConcurrent[F[_], E] extends GenSpawn[F, E] {
 
     implicit val F: GenConcurrent[F, E] = this
 
-    MiniSemaphore[F](n).flatMap { sem => ta.parTraverse_ { a => sem.withPermit(f(a)) } }
+    val work = ta.toList.toVector
+
+    ref(0).flatMap { idx =>
+      def step: F[Unit] =
+        idx.modify(i => (i + 1, i)).flatMap { i =>
+          if (i >= work.size) unit
+          else {
+            uncancelable { poll =>
+              start(f(work(i))).flatMap { fib =>
+                onCancel(poll(fib.join), fib.cancel).flatMap {
+                  case Outcome.Succeeded(fb) => fb.void
+                  case Outcome.Errored(e) => raiseError[Unit](e)
+                  case Outcome.Canceled() => poll(canceled) *> never[Unit]
+                }
+              }
+            } >> step
+          }
+        }
+
+      List.fill(n min work.size)(step).parSequence_
+    }
   }
 
   override def racePair[A, B](fa: F[A], fb: F[B])

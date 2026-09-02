@@ -60,6 +60,7 @@ import scala.concurrent.duration._
 import scala.util.{Failure, Success, Try}
 
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.Executor
 
 import Platform.static
@@ -2025,6 +2026,65 @@ object IO extends IOCompanionPlatform with IOLowPriorityImplicits with TuplePara
 
     override def guaranteeCase[A](fa: IO[A])(fin: OutcomeIO[A] => IO[Unit]): IO[A] =
       fa.guaranteeCase(fin)
+
+    override def parTraverseN[T[_]: Traverse, A, B](n: Int)(ta: T[A])(f: A => IO[B]): IO[T[B]] = {
+      require(n >= 1, s"Concurrency limit should be at least 1, was: $n")
+
+      IO.defer {
+        val work = ta.toList.toVector
+        val size = work.size
+        val results = new Array[AnyRef](size)
+        val idx = new AtomicInteger(0)
+
+        def step: IO[Unit] =
+          IO(idx.getAndIncrement()).flatMap { i =>
+            if (i >= size) IO.unit
+            else {
+              IO.uncancelable { poll =>
+                f(work(i)).start.flatMap { fib =>
+                  poll(fib.join).onCancel(fib.cancel).flatMap {
+                    case Outcome.Succeeded(fb) =>
+                      fb.flatMap(b => IO(results(i) = b.asInstanceOf[AnyRef]))
+                    case Outcome.Errored(e) => IO.raiseError[Unit](e)
+                    case Outcome.Canceled() => poll(IO.canceled) *> IO.never
+                  }
+                }
+              } >> step
+            }
+          }
+
+        List.fill(n min size)(step).parSequence_ *>
+          IO(ta.mapWithIndex((_, i) => results(i).asInstanceOf[B]))
+      }
+    }
+
+    override def parTraverseN_[T[_]: Foldable, A, B](n: Int)(ta: T[A])(f: A => IO[B]): IO[Unit] = {
+      require(n >= 1, s"Concurrency limit should be at least 1, was: $n")
+
+      IO.defer {
+        val work = ta.toList.toVector
+        val size = work.size
+        val idx = new AtomicInteger(0)
+
+        def step: IO[Unit] =
+          IO(idx.getAndIncrement()).flatMap { i =>
+            if (i >= size) IO.unit
+            else {
+              IO.uncancelable { poll =>
+                f(work(i)).start.flatMap { fib =>
+                  poll(fib.join).onCancel(fib.cancel).flatMap {
+                    case Outcome.Succeeded(fb) => fb.void
+                    case Outcome.Errored(e) => IO.raiseError[Unit](e)
+                    case Outcome.Canceled() => poll(IO.canceled) *> IO.never
+                  }
+                }
+              } >> step
+            }
+          }
+
+        List.fill(n min size)(step).parSequence_
+      }
+    }
 
     override def handleError[A](fa: IO[A])(f: Throwable => A): IO[A] =
       fa.handleError(f)
